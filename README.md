@@ -1,80 +1,149 @@
-# 🩺 Medical Image AI Analyzer
+# 🩺 Medical Image AI Analyzer — Multi-Agent System
 
-A fully free, API-key-free medical image analysis system powered by **CLIP Vision AI**, **LangGraph**, **ChromaDB RAG**, and **Streamlit**. Upload an X-ray, CT scan, or MRI — get an instant AI diagnosis, attention heatmap, clinical suggestions, multilingual report, and voice audio.
+A **multi-agent AI system** for medical image analysis powered by **CLIP Vision AI**, **LangGraph**, **ChromaDB RAG**, and **Streamlit**. Upload an X-ray, CT scan, or MRI — 7 specialized AI agents collaborate to deliver an instant diagnosis, attention heatmap, clinical suggestions, multilingual report, and voice audio.
 
----
-
-## 🚀 Live Demo
-
-> Run locally with `streamlit run app.py` — no cloud deployment needed.
+> ✅ **100% Free — No API Key Required**
 
 ---
 
 ## 📌 Overview
 
-The **Medical Image AI Analyzer** is a multi-tool agentic AI system that analyzes medical images and provides structured clinical insights. It uses **CLIP (Contrastive Language–Image Pretraining)** — an open-source vision model that runs entirely on your CPU — to classify diseases, generate attention heatmaps, and power a semantic knowledge retrieval system.
+The **Medical Image AI Analyzer** is a true **multi-agent AI system** where 7 independent, specialized agents each handle a distinct part of the medical image analysis pipeline. Each agent has its own role, input, output, and error handling. They communicate through a shared **MedicalState** and some agents run **in parallel** for efficiency.
 
-The system is designed to be **completely free** with:
-- No Gemini API key
-- No OpenAI API key
-- No paid cloud services
-- Everything runs locally or uses free public endpoints
+The system uses **CLIP (Contrastive Language–Image Pretraining)** — an open-source vision model that runs entirely on your CPU — to classify diseases, generate attention heatmaps, and power the entire analysis without any paid API.
 
 ---
 
-## ✨ Key Features
+## 🤖 The 7 Agents
+
+| # | Agent | Role | Technology |
+|---|---|---|---|
+| 1 | **Prompt Agent** | Validates and rewrites vague user questions into precise clinical queries | Rule-based NLP |
+| 2 | **CLIP Screen Agent** | Classifies the image against 8 diseases and detects if it is a real medical scan | CLIP ViT-B/32 (local CPU) |
+| 3 | **Image Analysis Agent** | Produces structured diagnosis: DISEASE, SEVERITY, CONFIDENCE, SPECIALIST, FINDINGS | CLIP + Medical KB |
+| 4 | **Heatmap Agent** | Generates an attention rollout heatmap showing the disease region | CLIP ViT Attention Rollout + OpenCV |
+| 5 | **RAG Agent** | Retrieves disease-specific medical knowledge from the built-in knowledge base | ChromaDB (in-memory) |
+| 6 | **Suggestion Agent** | Generates patient-friendly clinical advice: immediate actions, warning signs, follow-up | Evidence-based templates |
+| 7 | **Translation Agent** | Translates the full report to 16 languages and generates voice audio | deep-translator + gTTS |
+
+---
+
+## 🏗️ Multi-Agent Architecture
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │         USER INPUT                       │
+                    │   Medical Image + Question + Language    │
+                    └────────────────┬────────────────────────┘
+                                     │
+                                     ▼
+                    ┌─────────────────────────────────────────┐
+                    │  AGENT 1: Prompt Agent                  │
+                    │  Rewrites vague questions into          │
+                    │  precise clinical queries               │
+                    └────────────────┬────────────────────────┘
+                                     │
+                                     ▼
+                    ┌─────────────────────────────────────────┐
+                    │  AGENT 2: CLIP Screen Agent             │
+                    │  • Detects if image is medical          │
+                    │  • Scores 8 disease categories          │
+                    │  • Generates 512-dim image embedding    │
+                    └────────────────┬────────────────────────┘
+                                     │
+                                     ▼
+                    ┌─────────────────────────────────────────┐
+                    │  AGENT 3: Image Analysis Agent          │
+                    │  • Structured diagnosis with            │
+                    │    DISEASE / SEVERITY / CONFIDENCE      │
+                    │  • Honest "I don't know" if unsure      │
+                    └──────┬──────────────────────────────────┘
+                           │
+               ┌───────────┴────────────┐
+               │  PARALLEL EXECUTION    │
+               ▼                        ▼
+┌──────────────────────────┐  ┌──────────────────────────────┐
+│  AGENT 4: Heatmap Agent  │  │  AGENT 5: RAG Agent          │
+│  • Attention Rollout     │  │  • Fetches only the          │
+│    across all 12 ViT     │  │    detected disease's        │
+│    transformer layers    │  │    knowledge document        │
+│  • COLORMAP_JET overlay  │  │  • No cross-disease mixing   │
+│  • Red bounding box      │  │                              │
+└──────────────┬───────────┘  └──────────────────┬───────────┘
+               │                                  │
+               └───────────┬──────────────────────┘
+                           │  (fan-in — both must complete)
+                           ▼
+                    ┌─────────────────────────────────────────┐
+                    │  AGENT 6: Suggestion Agent              │
+                    │  • Immediate actions                    │
+                    │  • Lifestyle changes                    │
+                    │  • Warning signs                        │
+                    │  • Follow-up advice                     │
+                    └────────────────┬────────────────────────┘
+                                     │
+                                     ▼
+                    ┌─────────────────────────────────────────┐
+                    │  AGENT 7: Translation Agent             │
+                    │  • Translates report to 16 languages    │
+                    │  • Generates gTTS voice audio           │
+                    └────────────────┬────────────────────────┘
+                                     │
+                                     ▼
+                    ┌─────────────────────────────────────────┐
+                    │  AGGREGATOR NODE                        │
+                    │  Merges all agent outputs into          │
+                    │  the final structured report            │
+                    └────────────────┬────────────────────────┘
+                                     │
+                                     ▼
+                    ┌─────────────────────────────────────────┐
+                    │         5-TAB STREAMLIT UI              │
+                    │  Diagnosis · Heatmap · Report ·         │
+                    │  Suggestions · Knowledge Base           │
+                    └─────────────────────────────────────────┘
+```
+
+### Key Design Properties
+
+- **Specialization** — each agent does one task only and does it well
+- **Parallel execution** — Agents 4 and 5 run simultaneously (fan-out / fan-in)
+- **Shared state** — all agents read/write to a single `MedicalState` TypedDict
+- **Isolated outputs** — each agent returns only its own state keys (prevents conflicts)
+- **Honest uncertainty** — if CLIP confidence < 18%, Agent 3 says "I don't know" instead of guessing
+- **Disease-specific RAG** — Agent 5 returns information only about the detected disease
+
+---
+
+## ✨ Features
 
 | Feature | Description |
 |---|---|
-| 🔬 **Disease Detection** | Classifies 8 medical conditions using CLIP locally on CPU |
-| 🌡️ **Attention Heatmap** | Visualizes disease regions using CLIP ViT Attention Rollout |
-| 📊 **CLIP Probability Chart** | Bar chart showing confidence scores for all 8 diseases |
-| 📚 **RAG Knowledge Base** | ChromaDB-powered retrieval of disease-specific medical knowledge |
-| 💊 **Clinical Suggestions** | Evidence-based immediate actions, lifestyle changes, and warning signs |
-| 🌍 **16-Language Translation** | Free Google Translate via deep-translator (no API key) |
-| 🔊 **Voice Audio** | Text-to-speech in 16 languages via gTTS (free Google TTS) |
-| ✅ **Honest Uncertainty** | Says "I don't know" when confidence is too low — no hallucination |
-
----
-
-## 🏗️ Architecture
-
-```
-User Upload (Image + Question)
-           │
-           ▼
-┌─────────────────────────────────────────────────────┐
-│              LangGraph Sequential Pipeline           │
-│                                                     │
-│  Tool 1: validate_prompt  → Refines vague questions │
-│  Tool 2: clip_screen      → CLIP disease screening  │
-│  Tool 3: analyze_image    → Structured diagnosis    │
-│  Tool 4: generate_heatmap ─┐                        │
-│                             ├── Parallel execution  │
-│  Tool 5: search_rag       ─┘                        │
-│  Tool 6: get_suggestions  → Clinical advice         │
-│  Tool 7: translate_report → Translation + Audio     │
-│  Node 8: aggregator       → Final report            │
-└─────────────────────────────────────────────────────┘
-           │
-           ▼
-    5-Tab Streamlit UI
-```
+| 🤖 **7 Specialized Agents** | Each agent handles a distinct step in the pipeline |
+| ⚡ **Parallel Processing** | Heatmap Agent and RAG Agent run simultaneously |
+| 🔬 **Disease Detection** | 8 medical conditions classified using local CLIP model |
+| 🌡️ **Attention Heatmap** | Attention Rollout across all 12 ViT layers for real disease localization |
+| 📊 **CLIP Probability Chart** | Bar chart showing confidence scores for all diseases |
+| 📚 **Disease-Specific RAG** | Only shows knowledge for the detected condition |
+| 💊 **Clinical Suggestions** | Evidence-based actions, lifestyle tips, and warning signs |
+| 🌍 **16-Language Support** | Free Google Translate — no API key |
+| 🔊 **Voice Audio** | Text-to-speech in 16 languages via gTTS |
+| ✅ **No Hallucination** | Low confidence → "I don't know" — never fabricates |
 
 ---
 
 ## 🦠 Supported Diseases
 
-| # | Disease | Imaging Modality |
+| Disease | Imaging | Typical Signs |
 |---|---|---|
-| 1 | Pneumonia | Chest X-ray |
-| 2 | Tuberculosis | Chest X-ray |
-| 3 | COVID-19 Pneumonia | Chest X-ray / CT |
-| 4 | Brain Tumor | MRI |
-| 5 | Bone Fracture | X-ray |
-| 6 | Diabetic Retinopathy | Fundus Photography |
-| 7 | Pleural Effusion | Chest X-ray |
-| 8 | Cardiomegaly | Chest X-ray |
+| Pneumonia | Chest X-ray | Consolidation, infiltrates |
+| Tuberculosis | Chest X-ray | Upper lobe cavitation, miliary pattern |
+| COVID-19 | Chest X-ray / CT | Bilateral ground-glass opacities |
+| Brain Tumor | MRI | Ring-enhancing mass, surrounding oedema |
+| Bone Fracture | X-ray | Cortical break, lucent fracture line |
+| Diabetic Retinopathy | Fundus | Microaneurysms, haemorrhages |
+| Pleural Effusion | Chest X-ray | Blunted costophrenic angle |
+| Cardiomegaly | Chest X-ray | CTR > 0.5 |
 
 ---
 
@@ -82,14 +151,15 @@ User Upload (Image + Question)
 
 | Component | Technology |
 |---|---|
-| **Vision AI** | CLIP `openai/clip-vit-base-patch32` (HuggingFace Transformers) |
+| **Multi-Agent Framework** | LangGraph `StateGraph` with parallel fan-out/fan-in |
+| **Vision AI** | CLIP `openai/clip-vit-base-patch32` (HuggingFace) |
 | **Heatmap** | CLIP ViT Attention Rollout + OpenCV COLORMAP_JET |
-| **Agent Pipeline** | LangGraph `StateGraph` with parallel fan-out/fan-in |
-| **Knowledge Base** | Medical document templates (disease-specific, direct lookup) |
-| **Translation** | deep-translator (free Google Translate) |
-| **Text-to-Speech** | gTTS (free Google TTS) |
-| **Frontend** | Streamlit (5-tab layout) |
-| **Deep Learning** | PyTorch (CPU) |
+| **Knowledge Base** | Built-in disease documents (direct lookup, no vector DB needed) |
+| **Translation** | deep-translator (free Google Translate, no API key) |
+| **Text-to-Speech** | gTTS (free Google TTS, no API key) |
+| **Frontend** | Streamlit 5-tab layout |
+| **Deep Learning** | PyTorch CPU |
+| **Agent Tools** | `@tool` decorated functions from `langchain_core` |
 
 ---
 
@@ -98,28 +168,22 @@ User Upload (Image + Question)
 ```
 medical_ai_project/
 │
-├── app.py                    # Streamlit frontend (5-tab UI)
-├── requirements.txt          # All dependencies
+├── app.py                    # Streamlit frontend — 5-tab multi-agent UI
+├── requirements.txt          # All Python dependencies
 ├── .env.example              # No API key needed
-├── .gitignore
+├── .gitignore                # Excludes cache, .env, venv
 │
 ├── tools/
 │   ├── __init__.py
-│   └── tool_definitions.py   # All 7 @tool functions
+│   └── tool_definitions.py   # All 7 agent @tool functions (CLIP, RAG, TTS, etc.)
 │
 ├── graph/
 │   ├── __init__.py
-│   ├── state.py              # MedicalState TypedDict
-│   └── workflow.py           # LangGraph pipeline + nodes
+│   ├── state.py              # MedicalState TypedDict — shared agent memory
+│   └── workflow.py           # LangGraph pipeline: 7 agent nodes + aggregator
 │
-└── agents/                   # Legacy pipeline (reference only)
-    ├── prompt_agent.py
-    ├── image_agent.py
-    ├── heatmap_agent.py
-    ├── rag_agent.py
-    ├── suggestion_agent.py
-    ├── aggregator_agent.py
-    └── multilingual_agent.py
+└── agents/                   # Legacy simple-pipeline agents (reference only)
+    └── (7 files)
 ```
 
 ---
@@ -128,8 +192,8 @@ medical_ai_project/
 
 ### Prerequisites
 - Python 3.10 or 3.11
-- 2 GB free disk space (for CLIP model cache on first run)
-- Internet connection (for CLIP model download on first run, and for translation/audio)
+- ~2 GB free disk space (CLIP model cache, first run only)
+- Internet connection (CLIP download on first run; translation and audio need internet)
 
 ### 1. Clone the repository
 
@@ -138,78 +202,71 @@ git clone https://github.com/prathyusha503/Health_GPT.git
 cd Health_GPT
 ```
 
-### 2. Install dependencies
+### 2. Install PyTorch (CPU version)
 
 ```bash
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+```
+
+### 3. Install all other dependencies
+
+```bash
 pip install -r requirements.txt
 ```
 
-### 3. Run the app
+### 4. Run the app
 
 ```bash
 streamlit run app.py
 ```
 
-### 4. Open in browser
+### 5. Open in browser
 
 ```
 http://localhost:8501
 ```
 
-> **No API key needed.** The sidebar shows a green "No API key required" message.
+> **No API key required.** Sidebar shows a green confirmation message.
 
 ---
 
 ## 🖥️ How to Use
 
-1. Go to **📤 Upload & Analyze** tab
-2. Upload a medical image (JPG, PNG, WEBP)
-3. Type your question — e.g. *"What disease is visible in this X-ray?"*
+1. Open **📤 Upload & Analyze** tab
+2. Upload a medical image (JPG, PNG, WEBP — X-ray, CT, MRI, Fundus)
+3. Type your question — e.g. *"What disease is visible in this chest X-ray?"*
 4. Click **🔬 Analyze Image**
-5. Wait for the 7-tool pipeline to complete (progress bar shows each step)
-6. Switch to other tabs to view results:
+5. Watch the 7 agents work (live progress bar)
+6. Navigate tabs for results:
 
-| Tab | Content |
+| Tab | What You See |
 |---|---|
-| **🔬 Diagnosis & Heatmap** | Disease metrics, CLIP bar chart, original vs heatmap |
-| **📋 Full Report** | Translated report, audio player, download button |
-| **💊 Suggestions** | Immediate actions, warning signs, follow-up advice |
-| **📚 Knowledge Base** | RAG-retrieved disease-specific medical knowledge |
+| **🔬 Diagnosis & Heatmap** | Disease name, severity, CLIP scores chart, original vs heatmap |
+| **📋 Full Report** | Translated report text, audio player, download as .txt |
+| **💊 Suggestions** | Color-coded sections: Immediate Actions, Warning Signs, Follow-Up |
+| **📚 Knowledge Base** | Disease-specific medical knowledge retrieved by RAG Agent |
 
 ---
 
-## 🌍 Supported Languages
-
-English · Telugu · Hindi · Tamil · Kannada · Malayalam · Bengali · Marathi · Gujarati · Punjabi · Arabic · Spanish · French · German · Chinese · Japanese
-
----
-
-## 🔒 Honesty & Safety
-
-- **Confidence threshold:** If CLIP confidence is below 18%, the system says *"I cannot determine the disease"* — no guessing
-- **Disease-specific only:** RAG and suggestions show information for the detected disease only — no mixing of other diseases
-- **Disclaimer:** All outputs are clearly marked as AI analysis for informational purposes only and not a substitute for professional medical diagnosis
-
----
-
-## 📦 Dependencies
+## 🌍 Supported Output Languages
 
 ```
-langgraph>=0.2.0
-langchain>=0.2.0
-langchain-core>=0.2.0
-streamlit>=1.35.0
-pillow>=10.0.0
-numpy>=1.26.0
-opencv-python-headless>=4.9.0
-torch>=2.2.0
-torchvision>=0.17.0
-transformers>=4.40.0
-gtts>=2.5.0
-deep-translator>=1.11.0
-python-dotenv>=1.0.0
+English · Telugu · Hindi · Tamil · Kannada · Malayalam
+Bengali · Marathi · Gujarati · Punjabi · Arabic · Spanish
+French · German · Chinese · Japanese
 ```
+
+---
+
+## 🔒 Accuracy & Safety Design
+
+| Design Choice | Reason |
+|---|---|
+| Confidence threshold (18%) | Prevents low-confidence guesses |
+| Disease-specific RAG | No cross-disease information mixing |
+| Attention Rollout (all 12 layers) | More accurate heatmap than single-layer attention |
+| Parallel agent execution | Heatmap and knowledge retrieval run simultaneously |
+| Isolated agent state returns | Prevents parallel state conflicts in LangGraph |
 
 ---
 

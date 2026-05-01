@@ -53,14 +53,15 @@ with st.sidebar:
     st.divider()
 
     st.info(
-        "**7-Tool Pipeline**\n\n"
-        "1. 🧠 Validate Prompt\n"
-        "2. 👁️ CLIP Screen\n"
-        "3. 🔬 Analyze Image\n"
-        "4. 🌡️ Generate Heatmap\n"
-        "5. 📚 Search RAG\n"
-        "6. 💊 Get Suggestions\n"
-        "7. 🌍 Translate Report"
+        "**7 Specialized AI Agents**\n\n"
+        "1. 🧠 Prompt Agent — refines question\n"
+        "2. 👁️ CLIP Screen Agent — disease classifier\n"
+        "3. 🔬 Image Analysis Agent — diagnosis\n"
+        "4. 🌡️ Heatmap Agent — attention map\n"
+        "5. 📚 RAG Agent — knowledge retrieval\n"
+        "6. 💊 Suggestion Agent — clinical advice\n"
+        "7. 🌍 Translation Agent — report + audio\n\n"
+        "Agents 4 & 5 run in **parallel** ⚡"
     )
     st.warning("Not a substitute for professional medical diagnosis.")
 
@@ -72,7 +73,7 @@ with st.sidebar:
 
 # ── App title ─────────────────────────────────────────────────────────────────
 st.title("🩺 Medical Image AI Analyzer")
-st.caption("CLIP Vision AI · ChromaDB RAG · LangGraph · Zero API Key · 100% Free")
+st.caption("7 Specialized AI Agents · CLIP Vision AI · LangGraph Multi-Agent Pipeline · Zero API Key · 100% Free")
 
 # ── 5 Tabs ────────────────────────────────────────────────────────────────────
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
