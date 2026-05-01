@@ -1,10 +1,17 @@
-from typing import TypedDict, Optional
+from typing import TypedDict, Optional, Annotated
+from langgraph.graph.message import add_messages
 
 
 class MedicalState(TypedDict):
+    # Supervisor conversation — add_messages reducer appends instead of overwriting
+    messages: Annotated[list, add_messages]
+
+    # Image and user inputs
     image_base64: str
     raw_prompt: str
     language: str
+
+    # Agent outputs — written progressively as each agent completes
     refined_prompt: str
     clip_scores: dict
     clip_top_disease: str

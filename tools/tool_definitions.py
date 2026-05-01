@@ -1,15 +1,25 @@
 """
-7 LangGraph tools — 100% free, zero API keys required.
-CLIP (local CPU) handles all vision tasks.
-deep-translator handles translation (free Google Translate).
-gTTS handles audio (free Google TTS).
-ChromaDB handles RAG knowledge retrieval.
+7 Specialized Agent Tools — Multi-Agent Medical Image AI System
+==============================================================
+Each tool is an independent specialized agent decorated with @tool.
+Tools use InjectedState to read image/context from shared state automatically.
+The Supervisor (Gemini LLM) decides WHICH tools to call and WHEN based on results.
+
+Tool signatures visible to Supervisor:
+  validate_prompt()                                       — no args
+  clip_screen()                                           — no args
+  analyze_image(clip_hint)                                — 1 arg
+  generate_heatmap(disease_label)                         — 1 arg
+  search_rag(disease_label)                               — 1 arg
+  get_suggestions(disease, severity, specialist)          — 3 args
+  translate_report()                                      — no args
 """
 
 import io
 import re
 import json
 import base64
+from typing import Annotated
 
 import numpy as np
 import cv2
@@ -17,9 +27,10 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from langchain_core.tools import tool
+from langgraph.prebuilt import InjectedState
 from gtts import gTTS
 
-# ── CLIP singleton (lazy-loaded on first use) ─────────────────────────────────
+# ── CLIP singleton ────────────────────────────────────────────────────────────
 _clip_model = None
 _clip_processor = None
 
@@ -95,398 +106,328 @@ AFFECTED_REGION_MAP = {
     "Normal":               "No pathological region identified",
 }
 
-# ── Medical knowledge base (8 diseases + Normal) ─────────────────────────────
+# ── Medical knowledge base ────────────────────────────────────────────────────
 MEDICAL_DOCS = {
     "Pneumonia": (
         "Pneumonia is a lung infection causing inflammation of the alveoli (air sacs), filling them with "
         "fluid or pus. On chest X-ray it appears as consolidation (white opaque areas) in one or both lungs. "
         "Lobar pneumonia shows dense homogeneous opacification of an entire lobe. Bronchopneumonia shows "
-        "patchy bilateral infiltrates. Air bronchograms (air-filled airways visible within consolidation) are "
-        "a characteristic sign. Viral pneumonia shows a diffuse interstitial pattern. "
-        "CLIP vision analysis confirms opacification in the affected lung field consistent with consolidation. "
-        "Treatment: Antibiotics (amoxicillin, azithromycin, levofloxacin) for bacterial pneumonia. "
-        "Antiviral medications for viral types. Oxygen therapy if SpO2 falls below 94%. "
-        "Hospitalisation for severe cases with IV antibiotics and respiratory support. "
-        "Specialist: Pulmonologist for moderate-severe cases; General Practitioner for mild. "
-        "Recovery typically takes 1–3 weeks with appropriate treatment. "
-        "Warning signs: SpO2 below 94%, cyanosis (blue lips/fingertips), confusion, respiratory rate above 30/min."
+        "patchy bilateral infiltrates. Air bronchograms are characteristic. Viral pneumonia shows diffuse "
+        "interstitial pattern. CLIP confirms opacification consistent with consolidation. "
+        "Treatment: Antibiotics (amoxicillin, azithromycin) for bacterial; antivirals for viral; "
+        "oxygen therapy if SpO2 below 94%. Hospitalisation for severe cases. "
+        "Specialist: Pulmonologist. Recovery 1-3 weeks. "
+        "Warning signs: SpO2 below 94%, cyanosis, confusion, respiratory rate above 30/min."
     ),
     "Tuberculosis": (
-        "Tuberculosis (TB) is caused by Mycobacterium tuberculosis and is spread via airborne droplets. "
-        "Chest X-ray shows upper lobe infiltrates, cavitation (thin-walled air-filled holes), hilar "
-        "lymphadenopathy, miliary pattern (millet-seed nodules throughout both lungs), and pleural effusion. "
-        "The Ghon complex (primary focus + lymph node) is seen in primary infection. Tree-in-bud pattern "
-        "on CT indicates active endobronchial spread. CLIP analysis identifies upper lobe disease and "
-        "possible cavitary changes characteristic of TB. "
-        "Treatment: DOTS therapy — Intensive phase (2 months): Isoniazid (H) + Rifampicin (R) + "
-        "Pyrazinamide (Z) + Ethambutol (E). Continuation phase (4 months): H + R. "
-        "MDR-TB requires second-line drugs. Patient must be isolated. Mandatory public health notification. "
-        "Specialist: Infectious Disease Specialist or Pulmonologist. "
-        "Warning signs: Massive haemoptysis (coughing blood), respiratory failure, miliary spread."
+        "Tuberculosis (TB) is caused by Mycobacterium tuberculosis, spread by airborne droplets. "
+        "Chest X-ray shows upper lobe infiltrates, cavitation, hilar lymphadenopathy, miliary pattern. "
+        "CLIP identifies upper lobe disease and cavitary changes. Treatment: DOTS HRZE regimen 6-9 months. "
+        "Patient isolation required. Mandatory public health notification. "
+        "Specialist: Infectious Disease Specialist / Pulmonologist. "
+        "Warning signs: Massive haemoptysis, respiratory failure, miliary spread."
     ),
     "COVID-19": (
-        "COVID-19 pneumonia is caused by SARS-CoV-2 coronavirus, affecting the lungs bilaterally. "
-        "CT scan is more sensitive than chest X-ray. CT shows bilateral peripheral ground-glass opacities "
-        "(GGO) predominantly in the lower lobes, crazy-paving pattern (GGO with interlobular septal "
-        "thickening), peripheral consolidation, and vascular thickening. Chest X-ray shows bilateral "
-        "infiltrates and haziness. CLIP analysis detects bilateral peripheral opacities characteristic "
-        "of COVID-19 pattern. Typical progression: peripheral GGO → consolidation → potential fibrosis. "
-        "Treatment: Mild — rest, hydration, antipyretics. Moderate — hospitalisation, supplemental oxygen. "
-        "Severe — dexamethasone, remdesivir, anticoagulation, prone positioning. "
-        "Critical — ICU, mechanical ventilation. "
-        "Specialist: Pulmonologist / Intensivist for severe cases. "
-        "Warning signs: SpO2 below 90%, respiratory rate above 30/min, confusion, inability to speak in sentences."
+        "COVID-19 pneumonia caused by SARS-CoV-2. CT shows bilateral peripheral ground-glass opacities, "
+        "crazy-paving pattern, lower lobe predominance. CLIP detects bilateral peripheral opacities. "
+        "Treatment: Mild — rest, hydration. Severe — dexamethasone, remdesivir, prone positioning. "
+        "Critical — ICU, mechanical ventilation. Specialist: Pulmonologist / Intensivist. "
+        "Warning signs: SpO2 below 90%, respiratory rate above 30, confusion."
     ),
     "Brain Tumor": (
-        "Brain tumors are abnormal intracranial cell growth — either primary (originating in the brain) "
-        "or metastatic (spread from elsewhere). MRI with gadolinium contrast is the gold standard. "
-        "Glioblastoma (GBM): ring-enhancing mass with central necrosis, surrounding vasogenic oedema "
-        "(bright T2/FLAIR), and mass effect with midline shift. Meningioma: extra-axial homogeneous "
-        "enhancement with dural tail sign. Metastases: multiple ring-enhancing lesions at grey-white "
-        "matter junction. CT shows hyperdense mass, calcification, or haemorrhage. "
-        "CLIP analysis detects mass effect and surrounding signal change consistent with intracranial lesion. "
-        "Treatment: Surgery (craniotomy/resection), radiotherapy, chemotherapy (temozolomide for GBM). "
-        "Steroids (dexamethasone) for cerebral oedema reduction. Targeted therapy for specific mutations. "
-        "Specialist: Neurosurgeon, Neuro-oncologist, Radiation Oncologist. "
-        "Warning signs: Sudden severe headache (thunderclap), new-onset seizure, rapid neurological deterioration."
+        "Brain tumors are abnormal intracranial cell growth — primary or metastatic. MRI shows mass lesion "
+        "with surrounding oedema. Glioblastoma: ring-enhancing mass with central necrosis. Meningioma: "
+        "extra-axial enhancement with dural tail. CLIP detects mass effect. "
+        "Treatment: Surgery, radiotherapy, chemotherapy (temozolomide for GBM). Steroids for oedema. "
+        "Specialist: Neurosurgeon, Neuro-oncologist. "
+        "Warning signs: Thunderclap headache, new seizure, rapid neurological deterioration."
     ),
     "Bone Fracture": (
-        "Bone fractures represent cortical discontinuity caused by trauma, stress, or underlying bone disease. "
-        "X-ray shows a lucent fracture line, cortical break, displacement, angulation, periosteal reaction, "
-        "and soft tissue swelling. Types: simple (closed), compound (open with skin breach), comminuted "
-        "(multiple fragments), stress (repetitive microtrauma), pathological (through diseased bone), "
-        "greenstick (incomplete, in children), compression (vertebral). "
-        "CT is used for complex fractures and occult injuries. MRI detects bone marrow oedema, "
-        "occult fractures, and ligament injuries. CLIP identifies cortical disruption at the fracture site. "
-        "Treatment: Immobilisation (cast/splint/brace), closed or open reduction, surgical fixation "
-        "(ORIF with plates, screws, intramedullary nails), external fixation. Physiotherapy for rehabilitation. "
-        "Specialist: Orthopaedic Surgeon. Recovery: 6–8 weeks simple, 3–6 months complex. "
-        "Warning signs: Loss of sensation or pulse distal to fracture, compartment syndrome, open fracture."
+        "Bone fractures show cortical discontinuity on X-ray — lucent fracture line, displacement, angulation. "
+        "CLIP identifies cortical disruption. Types: simple, comminuted, stress, pathological. "
+        "Treatment: Immobilisation (cast/splint), surgical fixation (ORIF). Physiotherapy for rehab. "
+        "Specialist: Orthopaedic Surgeon. Recovery 6-8 weeks simple, 3-6 months complex. "
+        "Warning signs: Loss of pulse/sensation distal to fracture, compartment syndrome, open fracture."
     ),
     "Diabetic Retinopathy": (
-        "Diabetic retinopathy is progressive retinal microvascular damage caused by chronic hyperglycaemia; "
-        "the leading cause of preventable blindness in working-age adults. "
-        "Fundus photography shows: microaneurysms (earliest sign — small red dots), dot and blot "
-        "haemorrhages, hard exudates (bright yellow lipid deposits near leaky vessels), cotton-wool spots "
-        "(fluffy white areas of nerve fibre infarction), and neovascularisation (fragile new vessel growth "
-        "in proliferative stage). OCT reveals macular oedema and retinal thickening. "
-        "CLIP detects haemorrhage and exudate patterns characteristic of diabetic retinopathy. "
-        "Classification: Non-proliferative (NPDR) mild/moderate/severe → Proliferative (PDR). "
-        "Treatment: Strict glycaemic control (HbA1c < 7%), blood pressure control. Anti-VEGF intravitreal "
-        "injections (ranibizumab, bevacizumab, aflibercept) for macular oedema and PDR. "
-        "Laser photocoagulation. Vitrectomy for advanced vitreous haemorrhage or retinal detachment. "
-        "Specialist: Ophthalmologist / Retina Specialist. Annual dilated eye exam mandatory for all diabetics. "
-        "Warning signs: Sudden painless vision loss, new floaters (vitreous haemorrhage), curtain across vision."
+        "Diabetic retinopathy causes progressive retinal microvascular damage. Fundus shows microaneurysms, "
+        "dot/blot haemorrhages, hard exudates, cotton-wool spots, neovascularisation. CLIP detects "
+        "haemorrhage and exudate patterns. Treatment: HbA1c control, anti-VEGF injections, laser. "
+        "Specialist: Ophthalmologist / Retina Specialist. Annual screening mandatory. "
+        "Warning signs: Sudden vision loss, new floaters, curtain across vision."
     ),
     "Pleural Effusion": (
-        "Pleural effusion is abnormal fluid accumulation in the pleural space between lung and chest wall. "
-        "Chest X-ray shows: blunting of costophrenic angle (detectable at ~200 mL), meniscus sign (concave "
-        "upper fluid border), progressive hemithoracic opacification, mediastinal shift away from large "
-        "effusions. Lateral decubitus X-ray shows freely layering fluid. Ultrasound is most sensitive for "
-        "detection and guides drainage. CT differentiates exudate from transudate and identifies cause. "
-        "CLIP detects basal opacification and blunted costophrenic angle. "
-        "Causes — Transudate (protein-poor): heart failure, liver cirrhosis, nephrotic syndrome. "
-        "Exudate (protein-rich, Light's criteria): pneumonia (parapneumonic), malignancy, TB, pulmonary embolism. "
-        "Treatment: Thoracentesis for large/symptomatic effusions. Chest tube for empyema. "
-        "Pleurodesis for recurrent malignant effusions. Treat underlying cause. "
-        "Specialist: Pulmonologist or Interventional Radiologist. "
-        "Warning signs: Severe dyspnoea, haemodynamic instability, mediastinal shift (tension physiology)."
+        "Pleural effusion is fluid in pleural space. X-ray shows blunted costophrenic angle, meniscus sign, "
+        "progressive opacification. CLIP detects basal opacification. Causes: heart failure, malignancy, "
+        "pneumonia, TB. Treatment: Thoracentesis, chest tube, treat underlying cause. "
+        "Specialist: Pulmonologist / Interventional Radiologist. "
+        "Warning signs: Severe dyspnoea, haemodynamic instability, mediastinal shift."
     ),
     "Cardiomegaly": (
-        "Cardiomegaly is abnormal cardiac enlargement, defined radiographically as a cardiothoracic (CT) "
-        "ratio greater than 0.5 on a PA chest X-ray. The heart appears to occupy more than half the "
-        "transverse diameter of the chest. Globular cardiac silhouette suggests pericardial effusion. "
-        "Cephalization of pulmonary vessels and Kerley B lines indicate elevated filling pressures. "
-        "CLIP identifies increased cardiac silhouette relative to thoracic diameter. "
-        "Causes: Dilated cardiomyopathy (DCM), hypertensive heart disease, valvular disease (aortic or "
-        "mitral regurgitation), ischaemic cardiomyopathy, myocarditis, pericardial effusion, "
-        "congenital heart defects, high-output states (anaemia, thyrotoxicosis). "
-        "Echocardiogram is mandatory for definitive evaluation of structure and function. "
-        "Treatment: ACE inhibitors/ARBs, beta-blockers, loop diuretics (furosemide), spironolactone. "
-        "ICD for arrhythmia prevention. Cardiac resynchronisation therapy (CRT). Heart transplant for end-stage. "
-        "Specialist: Cardiologist; Cardiac Surgeon for structural intervention. "
-        "Warning signs: Acute pulmonary oedema (pink frothy sputum), cardiogenic shock, dangerous arrhythmia."
+        "Cardiomegaly means CTR greater than 0.5 on chest X-ray. Causes: dilated cardiomyopathy, "
+        "hypertension, valve disease, pericardial effusion. CLIP identifies enlarged cardiac silhouette. "
+        "Echocardiogram required. Treatment: ACE inhibitors, beta-blockers, diuretics (furosemide). "
+        "Specialist: Cardiologist. "
+        "Warning signs: Acute pulmonary oedema, cardiogenic shock, dangerous arrhythmia."
     ),
     "Normal": (
-        "No significant pathological findings identified on this medical image. "
-        "The imaging features appear within normal limits for the modality used. "
-        "CLIP vision analysis shows no features consistent with the 8 screened diseases. "
-        "A normal AI screening result does not exclude subtle or early-stage pathology. "
-        "Clinical correlation with patient symptoms and history remains paramount. "
-        "If symptoms persist despite a normal image, additional imaging modalities or specialist review "
-        "may be warranted. Continue regular health check-ups and preventive care. "
-        "Specialist: General Practitioner for routine follow-up and clinical correlation."
+        "No significant pathological findings. Image appears within normal limits. "
+        "CLIP shows no features consistent with the 8 screened diseases. "
+        "A normal AI result does not exclude subtle pathology — clinical correlation is essential. "
+        "Specialist: General Practitioner for routine follow-up."
     ),
 }
 
-# ── Suggestions templates per disease ────────────────────────────────────────
+# ── Suggestions templates ─────────────────────────────────────────────────────
 _SUGG = {
     "Pneumonia": {
         "immediate": [
-            "Seek medical attention today — do not delay if breathing is laboured or SpO2 drops",
-            "Rest completely and avoid all physical exertion until cleared by your doctor",
-            "Drink warm fluids (water, clear broth, herbal tea) every hour to stay well hydrated",
-            "Monitor oxygen levels with a pulse oximeter — go to ER if below 94%",
+            "Seek medical attention today — do not delay if breathing is laboured",
+            "Rest completely and avoid all physical exertion",
+            "Drink warm fluids every hour to stay hydrated",
+            "Monitor oxygen levels — go to ER if SpO2 drops below 94%",
         ],
         "lifestyle": [
-            "Eat light, easily digestible meals — soups, soft rice, steamed vegetables",
-            "Sleep with head and chest elevated at 30° to ease breathing",
-            "Avoid cold air, dust, cigarette smoke, and air pollutants completely",
-            "Use a clean humidifier to keep room air moist and reduce irritation",
+            "Eat light, easily digestible meals — soups and soft foods",
+            "Sleep with head elevated at 30° to ease breathing",
+            "Avoid cold air, dust, and cigarette smoke completely",
+            "Use a humidifier to keep room air moist",
         ],
         "medications": [
-            "Antibiotic therapy (type and dose prescribed by your doctor — never self-prescribe)",
-            "Paracetamol or ibuprofen for fever and discomfort — follow recommended dosage",
-            "Expectorant syrups to loosen and clear mucus — as advised by pharmacist",
+            "Antibiotic therapy as prescribed by your doctor",
+            "Paracetamol for fever — follow recommended dosage",
+            "Expectorant syrups to loosen mucus — as advised",
         ],
         "warning": [
-            "Oxygen saturation drops below 94% — call emergency services immediately",
+            "SpO2 drops below 94% — call emergency services immediately",
             "Lips or fingertips turn blue (cyanosis) — go to ER at once",
-            "Confusion, inability to stay awake, or breathing rate above 30/min — emergency",
+            "Confusion or breathing rate above 30/min — emergency",
         ],
-        "followup": {
-            "mild": "within 3–5 days",
-            "moderate": "within 24–48 hours",
-            "severe": "immediately — go to the emergency room",
-        },
+        "followup": {"mild": "within 3-5 days", "moderate": "within 24-48 hours", "severe": "immediately"},
     },
     "Tuberculosis": {
         "immediate": [
-            "Isolate yourself from others — wear a surgical mask and ensure good room ventilation",
-            "Notify close contacts so they can be screened for TB exposure",
-            "Begin TB treatment ONLY as prescribed by your infectious disease doctor",
-            "Cover your mouth with a tissue when coughing and dispose of tissues safely",
+            "Isolate immediately — wear a mask and ventilate your room",
+            "Notify close contacts for screening",
+            "Start TB treatment ONLY as prescribed",
+            "Cover mouth when coughing — dispose tissues safely",
         ],
         "lifestyle": [
-            "Eat a high-protein, nutrient-rich diet to support immune system recovery",
-            "Get adequate sunlight daily for Vitamin D — supports immune function",
-            "Complete ALL prescribed medication without missing a single dose — stopping early causes drug resistance",
-            "Avoid alcohol entirely as it interferes with TB medications and liver function",
+            "High-protein diet to support immune recovery",
+            "Complete ALL medication — stopping causes drug resistance",
+            "Get sunlight daily for Vitamin D",
+            "Avoid alcohol entirely — interferes with TB drugs",
         ],
         "medications": [
-            "First-line HRZE anti-TB drugs (Isoniazid, Rifampicin, Pyrazinamide, Ethambutol) — as prescribed",
-            "Pyridoxine (Vitamin B6) to prevent peripheral neuropathy caused by Isoniazid",
-            "Never share, adjust, or stop TB medications without direct medical supervision",
+            "HRZE regimen as prescribed — Isoniazid, Rifampicin, Pyrazinamide, Ethambutol",
+            "Pyridoxine (Vitamin B6) to prevent nerve damage from Isoniazid",
+            "Never adjust TB medications without medical supervision",
         ],
         "warning": [
-            "Coughing up large amounts of blood (haemoptysis) — call emergency services immediately",
-            "Sudden severe difficulty breathing or respiratory distress — go to ER",
-            "Yellow eyes or skin (jaundice) or severe abdominal pain — stop medication and seek urgent care",
+            "Coughing up large amounts of blood — call emergency services",
+            "Sudden severe breathing difficulty — go to ER",
+            "Yellow eyes or skin — stop medication and seek urgent care",
         ],
-        "followup": {
-            "mild": "within 1 week",
-            "moderate": "within 48 hours",
-            "severe": "immediately — hospitalisation required",
-        },
+        "followup": {"mild": "within 1 week", "moderate": "within 48 hours", "severe": "immediately"},
     },
     "COVID-19": {
         "immediate": [
-            "Self-isolate immediately to prevent spreading the virus to household members",
-            "Monitor your oxygen saturation every 4 hours — go to hospital if below 94%",
-            "Rest completely and drink at least 2–3 litres of fluid per day",
-            "Inform your doctor, employer, and close contacts of your status",
+            "Self-isolate immediately to prevent spreading",
+            "Monitor SpO2 every 4 hours — hospital if below 94%",
+            "Rest and drink 2-3 litres of fluid per day",
+            "Inform doctor and close contacts",
         ],
         "lifestyle": [
-            "Sleep in prone position (on your stomach) periodically to improve oxygen levels if breathless",
-            "Eat small frequent meals rich in Vitamin C, D, and Zinc",
-            "Perform gentle breathing exercises (deep diaphragmatic breathing) once acute symptoms improve",
-            "Avoid smoking, alcohol, and any strenuous physical activity during illness",
+            "Sleep prone (on stomach) to improve oxygen levels if breathless",
+            "Small frequent meals rich in Vitamin C, D, Zinc",
+            "Gentle breathing exercises once symptoms improve",
+            "Avoid smoking and alcohol during illness",
         ],
         "medications": [
-            "Paracetamol for fever and body ache management — follow dosage instructions",
-            "Antiviral medications (e.g., remdesivir) for hospitalised patients — doctor prescribed only",
-            "Corticosteroids (dexamethasone) for severe cases needing oxygen — hospital use only",
+            "Paracetamol for fever — follow dosage instructions",
+            "Antivirals (remdesivir) for hospitalised patients — doctor prescribed",
+            "Corticosteroids (dexamethasone) for severe oxygen-needing cases — hospital only",
         ],
         "warning": [
-            "Oxygen saturation falls below 90% — go to the emergency room immediately",
-            "Persistent chest pain or pressure that does not resolve — call emergency services",
-            "Confusion, inability to wake up, or blue-coloured lips — life-threatening emergency",
+            "SpO2 below 90% — go to emergency immediately",
+            "Persistent chest pain — call emergency services",
+            "Confusion or blue lips — life-threatening emergency",
         ],
-        "followup": {
-            "mild": "within 3–5 days (teleconsult acceptable)",
-            "moderate": "within 24 hours",
-            "severe": "immediately — hospitalisation required",
-        },
+        "followup": {"mild": "within 3-5 days", "moderate": "within 24 hours", "severe": "immediately"},
     },
     "Brain Tumor": {
         "immediate": [
-            "Contact a neurosurgeon or neurologist immediately for urgent MRI with contrast",
-            "Do not drive — seizure risk makes all driving unsafe until medically cleared",
-            "Take anti-oedema medication (e.g., dexamethasone) only as prescribed",
-            "Arrange for a trusted family member or caregiver to accompany you to appointments",
+            "Contact neurosurgeon immediately for urgent MRI",
+            "Do not drive — seizure risk",
+            "Take prescribed steroids (dexamethasone) for brain swelling only as directed",
+            "Arrange a caregiver to accompany you to appointments",
         ],
         "lifestyle": [
-            "Eat an anti-inflammatory diet — leafy greens, berries, omega-3 rich foods, turmeric",
-            "Maintain a regular sleep schedule — sleep is critical for neurological recovery",
-            "Avoid alcohol, recreational drugs, and high-stress environments completely",
-            "Join a brain tumour patient support group for emotional and psychological wellbeing",
+            "Anti-inflammatory diet — leafy greens, berries, omega-3",
+            "Regular sleep schedule — essential for brain recovery",
+            "Avoid alcohol and high-stress environments",
+            "Join a brain tumour support group for emotional wellbeing",
         ],
         "medications": [
-            "Corticosteroids (dexamethasone) to reduce cerebral oedema — as prescribed",
-            "Anticonvulsants if seizures have occurred — doctor prescribed and monitored",
-            "Chemotherapy agents (e.g., temozolomide for GBM) — under specialist supervision only",
+            "Corticosteroids (dexamethasone) for oedema — as prescribed",
+            "Anticonvulsants if seizures occurred — doctor prescribed",
+            "Chemotherapy (temozolomide for GBM) — specialist supervised",
         ],
         "warning": [
-            "New or worsening seizure of any type — call emergency services immediately",
-            "Sudden severe headache unlike any before ('thunderclap') — go to ER at once",
-            "Sudden loss of speech, weakness on one side, or acute confusion — stroke-like emergency",
+            "New or worsening seizure — call emergency services",
+            "Sudden severe headache — go to ER immediately",
+            "Sudden loss of speech or weakness — stroke-like emergency",
         ],
-        "followup": {
-            "mild": "within 1 week",
-            "moderate": "within 48 hours",
-            "severe": "same day — urgent neurosurgical evaluation required",
-        },
+        "followup": {"mild": "within 1 week", "moderate": "within 48 hours", "severe": "same day"},
     },
     "Bone Fracture": {
         "immediate": [
-            "Immobilise the injured limb — do not attempt to realign the bone yourself",
-            "Apply ice wrapped in a cloth for 20 minutes every hour to reduce pain and swelling",
-            "Elevate the injured limb above heart level when sitting or lying",
-            "Go to the emergency room for X-ray confirmation and proper immobilisation",
+            "Immobilise the injured limb — do not try to realign",
+            "Apply ice wrapped in cloth for 20 minutes every hour",
+            "Elevate limb above heart level",
+            "Go to emergency room for X-ray and immobilisation",
         ],
         "lifestyle": [
-            "Increase dietary calcium — dairy products, sardines, leafy greens, fortified foods",
-            "Ensure adequate Vitamin D through safe sunlight exposure or prescribed supplements",
-            "Avoid weight-bearing on the affected limb until cleared by your orthopaedic surgeon",
-            "Follow all physiotherapy exercises during recovery to restore full range of motion",
+            "Increase calcium — dairy, leafy greens, fortified foods",
+            "Ensure adequate Vitamin D through sunlight or supplements",
+            "No weight-bearing until cleared by orthopaedic surgeon",
+            "Follow all physiotherapy exercises during recovery",
         ],
         "medications": [
-            "Analgesics (paracetamol, NSAIDs like ibuprofen) for pain management — as tolerated",
-            "Calcium and Vitamin D supplements to support bone healing and remodelling",
-            "Bisphosphonates only if prescribed for underlying osteoporosis or pathological fracture",
+            "Paracetamol or NSAIDs for pain management",
+            "Calcium and Vitamin D supplements to support healing",
+            "Bisphosphonates only if prescribed for pathological fracture",
         ],
         "warning": [
-            "Severe numbness, weakness, or no pulse in the limb below the fracture — vascular/nerve emergency",
-            "Rapidly increasing swelling with severe pain not relieved by elevation — compartment syndrome",
-            "Bone visible through skin or an open wound near the fracture — open fracture emergency",
+            "Numbness or no pulse below fracture — vascular emergency",
+            "Rapidly increasing swelling — compartment syndrome",
+            "Bone visible through skin — open fracture emergency",
         ],
-        "followup": {
-            "mild": "within 1–2 days",
-            "moderate": "within 24 hours",
-            "severe": "emergency room immediately",
-        },
+        "followup": {"mild": "within 1-2 days", "moderate": "within 24 hours", "severe": "emergency room"},
     },
     "Diabetic Retinopathy": {
         "immediate": [
-            "Schedule an urgent appointment with an ophthalmologist or retina specialist this week",
-            "Check blood sugar levels immediately and log all readings for your doctor",
-            "If vision is suddenly blurred or you see new floaters — go to ophthalmology emergency today",
+            "Schedule urgent ophthalmologist appointment this week",
+            "Check blood sugar levels immediately and log readings",
+            "Sudden blurred vision or new floaters — ophthalmology emergency",
             "Take all diabetes medications without missing any dose",
         ],
         "lifestyle": [
-            "Strictly control blood sugar — target HbA1c below 7% as advised by your endocrinologist",
-            "Control blood pressure to below 130/80 mmHg through medication and low-salt diet",
-            "Follow a low-glycaemic, high-fibre diet — whole grains, legumes, non-starchy vegetables",
-            "Stop smoking — smoking dramatically accelerates diabetic retinopathy progression",
+            "Strict blood sugar control — HbA1c below 7%",
+            "Blood pressure below 130/80 — low-salt diet",
+            "Low-glycaemic diet — whole grains, legumes, vegetables",
+            "Stop smoking — dramatically worsens retinopathy",
         ],
         "medications": [
-            "Anti-VEGF intravitreal injections (ranibizumab, bevacizumab) for macular oedema — specialist administered",
-            "Blood glucose controlling medications — exactly as prescribed by your endocrinologist",
-            "ACE inhibitors for blood pressure control (preferred in diabetics) — as prescribed",
+            "Anti-VEGF injections (ranibizumab) for macular oedema — specialist administered",
+            "Blood glucose medications exactly as prescribed",
+            "ACE inhibitors for blood pressure — preferred in diabetics",
         ],
         "warning": [
-            "Sudden painless vision loss in one or both eyes — ophthalmology emergency immediately",
-            "A dark curtain or shadow descending across your vision — retinal detachment emergency",
-            "Sudden onset of many new floaters or bright flashing lights — vitreous haemorrhage",
+            "Sudden painless vision loss — ophthalmology emergency",
+            "Dark curtain across vision — retinal detachment emergency",
+            "New floaters or flashing lights — vitreous haemorrhage",
         ],
-        "followup": {
-            "mild": "within 1 week",
-            "moderate": "within 48 hours",
-            "severe": "same day — ophthalmology emergency",
-        },
+        "followup": {"mild": "within 1 week", "moderate": "within 48 hours", "severe": "same day"},
     },
     "Pleural Effusion": {
         "immediate": [
-            "Seek medical evaluation promptly — the underlying cause must be identified and treated",
-            "Rest in a semi-reclined position (45°) to ease breathing and reduce chest tightness",
-            "Monitor your breathing rate — if above 25 breaths/min at rest, go to ER",
-            "Report all associated symptoms (fever, night sweats, leg swelling, weight loss) to your doctor",
+            "Seek medical evaluation promptly — identify the cause",
+            "Rest in semi-reclined position (45°) to ease breathing",
+            "Go to ER if breathing rate above 25/min at rest",
+            "Report all symptoms — fever, weight loss, leg swelling",
         ],
         "lifestyle": [
-            "Restrict salt intake to below 2g per day if cardiac or liver disease is the cause",
-            "Eat small frequent meals to avoid abdominal pressure on the compressed lung",
-            "Always sleep with the upper body elevated — never lie completely flat",
-            "Limit strenuous activity until fluid is drained and the underlying cause is treated",
+            "Restrict salt to below 2g per day if cardiac cause",
+            "Small frequent meals to avoid lung compression",
+            "Always sleep with upper body elevated",
+            "Limit strenuous activity until fluid is drained",
         ],
         "medications": [
-            "Diuretics (furosemide) if heart failure or fluid overload is the cause — as prescribed",
-            "Antibiotics if the effusion is infected (empyema or parapneumonic) — as prescribed",
-            "Anticoagulants if pulmonary embolism is the underlying cause — specialist managed",
+            "Diuretics (furosemide) if heart failure — as prescribed",
+            "Antibiotics if infected effusion — as prescribed",
+            "Anticoagulants if pulmonary embolism — specialist managed",
         ],
         "warning": [
-            "Sudden severe difficulty breathing or breathlessness at rest — call emergency services",
-            "Dizziness, very low blood pressure, or rapid heart rate — haemodynamic instability",
-            "Feeling of the neck or windpipe being pulled to one side — tension physiology emergency",
+            "Sudden severe breathlessness — call emergency services",
+            "Dizziness and low blood pressure — haemodynamic instability",
+            "Neck or windpipe pulled to one side — tension physiology",
         ],
-        "followup": {
-            "mild": "within 2–3 days",
-            "moderate": "within 24 hours",
-            "severe": "emergency room immediately — drainage required",
-        },
+        "followup": {"mild": "within 2-3 days", "moderate": "within 24 hours", "severe": "emergency room"},
     },
     "Cardiomegaly": {
         "immediate": [
-            "See your cardiologist urgently — request an echocardiogram to assess heart function",
-            "Restrict dietary salt to less than 2g (half a teaspoon) per day starting immediately",
-            "Weigh yourself every morning before eating — a gain of 2 kg in 2 days means fluid retention",
-            "Take all prescribed heart medications without missing a single dose",
+            "See cardiologist urgently — request echocardiogram",
+            "Restrict salt to less than 2g per day immediately",
+            "Weigh yourself daily — gain of 2kg means fluid retention",
+            "Take all heart medications without missing a dose",
         ],
         "lifestyle": [
-            "Adopt a heart-healthy diet — low sodium, low saturated fat, high fibre, plenty of vegetables",
-            "Restrict total daily fluid intake to 1.5–2 litres if your doctor advises it",
-            "Engage in only light walking or gentle activity — ask your cardiologist for exercise guidance",
-            "Quit smoking and avoid all alcohol — both directly worsen cardiac function",
+            "Heart-healthy diet — low sodium, low fat, high fibre",
+            "Restrict fluid to 1.5-2 litres daily if advised",
+            "Light walking only — ask cardiologist for exercise guidance",
+            "Quit smoking and avoid all alcohol",
         ],
         "medications": [
-            "ACE inhibitors or ARBs to reduce cardiac workload and prevent remodelling — as prescribed",
-            "Beta-blockers to slow heart rate and reduce myocardial oxygen demand — as prescribed",
-            "Loop diuretics (furosemide) to eliminate excess fluid — with regular electrolyte monitoring",
+            "ACE inhibitors/ARBs to reduce cardiac workload — as prescribed",
+            "Beta-blockers to slow heart rate — as prescribed",
+            "Furosemide to eliminate excess fluid — with electrolyte monitoring",
         ],
         "warning": [
-            "Sudden severe breathlessness with pink frothy sputum — acute pulmonary oedema, call ambulance",
-            "Chest pain with cold sweats and dizziness — possible cardiogenic shock emergency",
-            "Heart racing irregularly or palpitations above 150 bpm — dangerous arrhythmia emergency",
+            "Sudden breathlessness with pink frothy sputum — call ambulance",
+            "Chest pain with cold sweats — cardiogenic shock",
+            "Heart racing above 150 bpm irregularly — dangerous arrhythmia",
         ],
-        "followup": {
-            "mild": "within 3–5 days",
-            "moderate": "within 24–48 hours",
-            "severe": "emergency room immediately",
-        },
+        "followup": {"mild": "within 3-5 days", "moderate": "within 24-48 hours", "severe": "emergency room"},
     },
     "Normal": {
         "immediate": [
-            "No urgent action required based on current imaging findings",
-            "Continue all ongoing medications exactly as prescribed by your doctor",
-            "Discuss any persistent symptoms with your doctor — imaging is just one part of assessment",
-            "Keep this report safely for your medical records",
+            "No urgent action required based on imaging findings",
+            "Continue all prescribed medications as directed",
+            "Discuss any persistent symptoms with your doctor",
+            "Keep this report for your medical records",
         ],
         "lifestyle": [
-            "Maintain a balanced diet with plenty of fruits, vegetables, whole grains, and lean protein",
-            "Exercise regularly — at least 150 minutes of moderate aerobic activity per week",
-            "Get 7–9 hours of quality sleep every night — sleep is essential for overall health",
-            "Avoid smoking, recreational drugs, and excessive alcohol consumption",
+            "Maintain a balanced diet with fruits, vegetables, whole grains",
+            "Exercise regularly — 150 minutes moderate activity per week",
+            "Get 7-9 hours of quality sleep per night",
+            "Avoid smoking, drugs, and excessive alcohol",
         ],
         "medications": [
-            "No new medications required based on current imaging findings",
-            "Continue all currently prescribed medications exactly as directed",
-            "Discuss vitamin D and B12 supplementation needs with your doctor at next visit",
+            "No new medications required based on this imaging",
+            "Continue all current prescribed medications",
+            "Discuss vitamin supplementation with your doctor",
         ],
         "warning": [
-            "If new symptoms develop such as chest pain, breathlessness, or unexplained weight loss — seek care",
-            "Persistent symptoms despite a normal imaging result warrant further specialist investigation",
-            "Do not delay seeking care if symptoms worsen — a normal scan today does not guarantee tomorrow",
+            "New symptoms such as chest pain or breathlessness — seek care",
+            "Persistent symptoms despite normal imaging — further investigation needed",
+            "Do not delay seeking care if symptoms worsen",
         ],
-        "followup": {
-            "mild": "routine annual check-up",
-            "moderate": "within 2 weeks for clinical correlation",
-            "severe": "within 48 hours with the relevant specialist",
-        },
+        "followup": {"mild": "routine annual check-up", "moderate": "within 2 weeks", "severe": "within 48 hours"},
+    },
+    "Uncertain": {
+        "immediate": [
+            "I cannot provide specific suggestions because the disease could not be identified with sufficient confidence",
+            "Please consult a qualified medical professional for proper diagnosis",
+            "Bring this image to your doctor appointment",
+        ],
+        "lifestyle": [
+            "Maintain a healthy lifestyle while awaiting proper diagnosis",
+            "Rest and monitor your symptoms",
+        ],
+        "medications": [
+            "Do not self-medicate without a confirmed diagnosis",
+            "Continue any currently prescribed medications as directed",
+        ],
+        "warning": [
+            "If symptoms worsen rapidly — seek emergency care immediately",
+            "Difficulty breathing or chest pain — go to ER",
+        ],
+        "followup": {"mild": "within 1 week", "moderate": "within 48 hours", "severe": "immediately"},
     },
 }
 
-
-
-# ── Translation helper (deep-translator, free, no API key) ───────────────────
+# ── Translation helpers ───────────────────────────────────────────────────────
 _LANG_CODES = {
     "English": None, "Telugu": "te", "Hindi": "hi", "Tamil": "ta",
     "Kannada": "kn", "Malayalam": "ml", "Bengali": "bn", "Marathi": "mr",
@@ -505,8 +446,7 @@ _GTTS_CODES = {
 def _translate_text(text: str, lang_code: str) -> str:
     try:
         from deep_translator import GoogleTranslator
-        chunk_size = 4500
-        chunks = [text[i: i + chunk_size] for i in range(0, len(text), chunk_size)]
+        chunks = [text[i:i+4500] for i in range(0, len(text), 4500)]
         parts = []
         for chunk in chunks:
             try:
@@ -519,111 +459,88 @@ def _translate_text(text: str, lang_code: str) -> str:
         return text
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TOOL 1 — validate_prompt
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# AGENT 1 — validate_prompt
+# =============================================================================
 @tool
-def validate_prompt(raw_prompt: str) -> str:
+def validate_prompt(state: Annotated[dict, InjectedState]) -> str:
     """
-    Call this tool FIRST before any other tool.
-    Takes the user's raw question about a medical image and checks if it is
-    clear and medically relevant. If the question is vague like 'what is wrong'
-    or 'is this bad' or 'help', rewrite it into a precise structured clinical
-    question. If already clear, return it unchanged.
+    AGENT 1 — Call this FIRST before anything else.
+    Reads the user's raw medical question from shared state and rewrites vague
+    questions into precise clinical queries. If already clinical, returns unchanged.
+
+    No parameters needed — reads raw_prompt automatically from shared state.
 
     Examples of rewrites:
-    - 'what is wrong?' becomes 'Analyze this medical image and identify any
-      visible disease, affected anatomical region, and severity level.'
-    - 'is this bad?' becomes 'Examine this image and describe all pathological
-      findings, the disease name, and recommended next steps.'
+    - 'what is wrong?' → 'Analyze this medical image and identify visible disease, region, severity.'
+    - 'is this bad?' → 'Examine this image and describe all pathological findings and next steps.'
 
     Returns the refined clinical question as a string.
     """
     try:
-        prompt = raw_prompt.strip()
+        prompt = state.get("raw_prompt", "").strip()
         if not prompt:
-            return (
-                "Analyze this medical image and identify any visible disease, "
-                "affected anatomical region, severity level, and recommended specialist."
-            )
+            return "Analyze this medical image and identify any visible disease, affected region, and severity."
 
-        vague_triggers = {
-            "what", "help", "bad", "wrong", "this", "tell", "see",
-            "look", "check", "explain", "info", "information",
-        }
         words = set(re.findall(r"\w+", prompt.lower()))
-        is_short = len(prompt.split()) <= 6
-        is_vague = is_short and bool(words & vague_triggers)
+        vague = {"what", "help", "bad", "wrong", "this", "tell", "see", "look", "check", "explain"}
+        is_vague = len(prompt.split()) <= 6 and bool(words & vague)
 
         if is_vague:
             pl = prompt.lower()
             if any(w in pl for w in ["pneumonia", "lung", "chest", "breath"]):
-                return (
-                    "Analyze this chest X-ray and identify any consolidation, "
-                    "infiltrates, or signs of pneumonia. Provide severity and affected lung zones."
-                )
+                return ("Analyze this chest X-ray and identify consolidation, infiltrates, "
+                        "or signs of pneumonia. Provide severity and affected lung zones.")
             if any(w in pl for w in ["tumor", "brain", "mri", "head"]):
-                return (
-                    "Examine this brain MRI and describe any mass lesions, oedema, "
-                    "or abnormal enhancement. Provide location and differential diagnosis."
-                )
-            if any(w in pl for w in ["fracture", "bone", "break", "xray", "x-ray"]):
-                return (
-                    "Analyze this X-ray for any fracture lines or cortical breaks. "
-                    "Describe the fracture type, location, displacement, and severity."
-                )
-            return (
-                "Analyze this medical image and identify any visible disease, "
-                "affected anatomical region, severity level, AI confidence, "
-                "and recommend the appropriate medical specialist."
-            )
+                return ("Examine this brain MRI for mass lesions, oedema, or abnormal enhancement. "
+                        "Provide location and differential diagnosis.")
+            if any(w in pl for w in ["fracture", "bone", "break"]):
+                return ("Analyze this X-ray for fracture lines or cortical breaks. "
+                        "Describe type, location, and severity.")
+            return ("Analyze this medical image and identify any visible disease, "
+                    "affected anatomical region, severity, AI confidence, and recommended specialist.")
 
-        clinical_kw = {
-            "identify", "analyze", "diagnose", "describe", "findings",
-            "disease", "condition", "severity", "assessment", "pathology",
-        }
+        clinical_kw = {"identify", "analyze", "diagnose", "describe", "findings",
+                       "disease", "condition", "severity", "assessment", "pathology"}
         if not words & clinical_kw:
-            return (
-                prompt.rstrip("?!. ")
-                + ". Provide the disease name, severity level, and recommended specialist."
-            )
-
+            return (prompt.rstrip("?!. ") +
+                    ". Provide the disease name, severity level, and recommended specialist.")
         return prompt
 
-    except Exception:
-        return (
-            "Analyze this medical image and identify any visible disease, "
-            "affected anatomical region, and severity level."
-        )
+    except Exception as e:
+        return ("Analyze this medical image and identify any visible disease, "
+                f"affected region, and severity. (Error: {e})")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TOOL 2 — clip_screen
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# AGENT 2 — clip_screen
+# =============================================================================
 @tool
-def clip_screen(image_base64: str) -> str:
+def clip_screen(state: Annotated[dict, InjectedState]) -> str:
     """
-    Call this tool SECOND, right after validate_prompt.
-    Uses the CLIP model (openai/clip-vit-base-patch32) running locally on CPU.
-    1. Checks if the image is a medical scan vs a normal photograph.
+    AGENT 2 — Call this SECOND, right after validate_prompt.
+    Runs the CLIP vision model (openai/clip-vit-base-patch32) locally on CPU.
+
+    No parameters needed — reads image_base64 automatically from shared state.
+
+    Does THREE things:
+    1. Checks if the image is actually a medical scan (vs normal photograph).
     2. Returns probability scores for 9 disease categories.
-    3. Returns a 512-dimensional image embedding for semantic RAG search.
-    Returns a JSON string with: clip_scores, clip_top_disease, clip_is_medical,
-    clip_embedding (as list).
+    3. Generates a 512-dimensional image embedding.
+
+    Returns JSON string with: clip_scores, clip_top_disease, clip_is_medical, clip_embedding.
+
+    IMPORTANT for Supervisor decision-making:
+    - If clip_is_medical=False in result → warn user, consider skipping heatmap
+    - The clip_top_disease value should be passed as clip_hint to analyze_image
     """
     try:
         model, processor = _get_clip()
-        pil_image = _b64_to_pil(image_base64)
+        pil_image = _b64_to_pil(state["image_base64"])
 
         all_texts = DISEASE_TEXTS + SCAN_TEXTS
-        inputs = processor(
-            text=all_texts,
-            images=pil_image,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=77,
-        )
+        inputs = processor(text=all_texts, images=pil_image, return_tensors="pt",
+                           padding=True, truncation=True, max_length=77)
 
         with torch.no_grad():
             outputs = model(**inputs)
@@ -631,128 +548,114 @@ def clip_screen(image_base64: str) -> str:
 
         n_d = len(DISEASE_TEXTS)
         disease_probs = F.softmax(logits[:n_d], dim=0).cpu().numpy()
-        scan_probs = F.softmax(logits[n_d:], dim=0).cpu().numpy()
+        scan_probs    = F.softmax(logits[n_d:], dim=0).cpu().numpy()
 
         top_scan_idx = int(np.argmax(scan_probs))
         is_medical = SCAN_TEXTS[top_scan_idx] != "normal non-medical photograph"
 
-        clip_scores = {
-            name: round(float(p), 4)
-            for name, p in zip(DISEASE_NAMES, disease_probs)
-        }
-        top_disease = DISEASE_NAMES[int(np.argmax(disease_probs))]
+        clip_scores  = {name: round(float(p), 4) for name, p in zip(DISEASE_NAMES, disease_probs)}
+        top_disease  = DISEASE_NAMES[int(np.argmax(disease_probs))]
 
-        # 512-dim image embedding
         with torch.no_grad():
             img_in = processor(images=pil_image, return_tensors="pt")
-            feats = model.get_image_features(**img_in)
-            feats = feats / feats.norm(dim=-1, keepdim=True)
+            feats  = model.get_image_features(**img_in)
+            feats  = feats / feats.norm(dim=-1, keepdim=True)
             embedding = feats[0].cpu().numpy().tolist()
 
         return json.dumps({
-            "clip_scores": clip_scores,
+            "clip_scores":     clip_scores,
             "clip_top_disease": top_disease,
             "clip_is_medical": is_medical,
-            "clip_embedding": embedding,
+            "clip_embedding":  embedding,
         })
 
     except Exception as e:
         return json.dumps({
-            "clip_scores": {n: 0.0 for n in DISEASE_NAMES},
+            "clip_scores":     {n: 0.0 for n in DISEASE_NAMES},
             "clip_top_disease": "Unknown",
             "clip_is_medical": True,
-            "clip_embedding": [],
+            "clip_embedding":  [],
             "error": str(e),
         })
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TOOL 3 — analyze_image
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# AGENT 3 — analyze_image
+# =============================================================================
 @tool
-def analyze_image(image_base64: str, refined_prompt: str, clip_hint: str) -> str:
+def analyze_image(
+    clip_hint: str,
+    state: Annotated[dict, InjectedState],
+) -> str:
     """
-    Call this tool THIRD after clip_screen.
-    Uses CLIP disease probabilities to produce a structured clinical diagnosis
-    for the detected disease ONLY. If confidence is too low, honestly reports
-    that it cannot determine the disease rather than guessing.
-    Returns: DISEASE, SEVERITY, CONFIDENCE, SPECIALIST, FINDINGS, AFFECTED_REGION.
+    AGENT 3 — Call this THIRD after clip_screen.
+    Produces a structured clinical diagnosis using CLIP probabilities.
+
+    Parameters:
+      clip_hint: The top disease name from clip_screen result (e.g., "Pneumonia").
+                 Pass exactly as returned by clip_screen.
+
+    Reads image_base64 and refined_prompt automatically from shared state.
+
+    Returns structured text with:
+      DISEASE / SEVERITY / CONFIDENCE / SPECIALIST / FINDINGS / AFFECTED_REGION
+
+    IMPORTANT for Supervisor decision-making:
+    - If DISEASE = "Uncertain" → skip generate_heatmap, call get_suggestions with disease="Uncertain"
+    - If DISEASE is a real disease → proceed with generate_heatmap and search_rag
+    - CONFIDENCE value helps decide urgency of follow-up
     """
-    # Minimum confidence required to make any disease claim
     CONFIDENCE_THRESHOLD = 0.18
 
     try:
         model, processor = _get_clip()
-        pil_image = _b64_to_pil(image_base64)
+        pil_image = _b64_to_pil(state["image_base64"])
 
-        inputs = processor(
-            text=DISEASE_TEXTS,
-            images=pil_image,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=77,
-        )
+        inputs = processor(text=DISEASE_TEXTS, images=pil_image, return_tensors="pt",
+                           padding=True, truncation=True, max_length=77)
         with torch.no_grad():
             outputs = model(**inputs)
             disease_probs = F.softmax(outputs.logits_per_image[0], dim=0).cpu().numpy()
 
         sorted_probs = np.sort(disease_probs)[::-1]
-        top_idx   = int(np.argmax(disease_probs))
-        top_disease = DISEASE_NAMES[top_idx]
-        top_conf    = float(disease_probs[top_idx])
-        second_conf = float(sorted_probs[1])
+        top_idx      = int(np.argmax(disease_probs))
+        top_disease  = DISEASE_NAMES[top_idx]
+        top_conf     = float(disease_probs[top_idx])
+        second_conf  = float(sorted_probs[1])
 
-        # ── Honest uncertainty check ──────────────────────────────────────────
-        # Refuse to guess when: (a) confidence too low, OR (b) top two are
-        # so close that CLIP has no clear winner.
-        too_low   = top_conf < CONFIDENCE_THRESHOLD
-        too_close = (top_conf - second_conf) < 0.04
-
-        if too_low or too_close:
+        # Honest uncertainty — refuse to guess when confidence is too low
+        if top_conf < CONFIDENCE_THRESHOLD or (top_conf - second_conf) < 0.04:
             return (
                 f"DISEASE: Uncertain\n"
                 f"SEVERITY: Unknown\n"
                 f"CONFIDENCE: {top_conf:.2f}\n"
                 f"SPECIALIST: General Practitioner\n"
-                f"FINDINGS: I cannot determine the disease from this image with sufficient "
-                f"confidence (max score: {top_conf * 100:.1f}%). "
-                f"This may be because the image does not clearly show a pathological condition, "
-                f"the image quality is low, or the condition is outside the 8 diseases this "
-                f"system was designed to detect. Please consult a medical professional for "
-                f"a proper clinical evaluation.\n"
+                f"FINDINGS: Cannot determine disease with sufficient confidence "
+                f"(max score {top_conf*100:.1f}%). Image may not clearly show a pathological "
+                f"condition, or condition may be outside the 8 diseases this system covers. "
+                f"Please consult a medical professional.\n"
                 f"AFFECTED_REGION: Cannot determine"
             )
 
-        # ── Cross-check with CLIP pre-screen hint ─────────────────────────────
+        # Cross-check with clip_hint
         if clip_hint and clip_hint in DISEASE_NAMES:
             hint_idx  = DISEASE_NAMES.index(clip_hint)
             hint_conf = float(disease_probs[hint_idx])
-            if abs(hint_conf - top_conf) < 0.06 and clip_hint != top_disease:
+            if abs(hint_conf - top_conf) < 0.06:
                 top_disease = clip_hint
                 top_conf    = hint_conf
 
-        # ── Severity from confidence ───────────────────────────────────────────
-        if top_conf >= 0.50:
-            severity = "severe"
-        elif top_conf >= 0.28:
-            severity = "moderate"
-        else:
-            severity = "mild"
-
+        severity   = "severe" if top_conf >= 0.50 else ("moderate" if top_conf >= 0.28 else "mild")
         specialist = SPECIALIST_MAP.get(top_disease, "General Practitioner")
         affected   = AFFECTED_REGION_MAP.get(top_disease, "Unknown region")
 
-        # ── Findings: pull ONLY from this disease's document ──────────────────
         doc = MEDICAL_DOCS.get(top_disease, "")
-        imaging_sentences = [
-            s.strip() for s in doc.split(".")
-            if any(w in s.lower() for w in
-                   ["shows", "appears", "imaging", "x-ray", "mri", "ct",
-                    "clip", "pattern", "scan", "opacit", "consolidat",
-                    "enhancing", "effusion", "silhouette", "attn", "fundus"])
-        ]
-        findings = ". ".join(imaging_sentences[:4]).strip()
+        imaging_sents = [s.strip() for s in doc.split(".")
+                         if any(w in s.lower() for w in
+                                ["shows", "appears", "x-ray", "mri", "ct", "clip",
+                                 "pattern", "opacit", "consolidat", "enhancing",
+                                 "effusion", "silhouette", "fundus"])]
+        findings = ". ".join(imaging_sents[:4]).strip()
         if findings and not findings.endswith("."):
             findings += "."
         if not findings:
@@ -769,95 +672,85 @@ def analyze_image(image_base64: str, refined_prompt: str, clip_hint: str) -> str
 
     except Exception as e:
         return (
-            f"DISEASE: Uncertain\n"
-            f"SEVERITY: Unknown\n"
-            f"CONFIDENCE: 0.00\n"
+            f"DISEASE: Uncertain\nSEVERITY: Unknown\nCONFIDENCE: 0.00\n"
             f"SPECIALIST: General Practitioner\n"
-            f"FINDINGS: Analysis encountered an error: {str(e)}. "
-            f"Please consult a medical professional.\n"
-            f"AFFECTED_REGION: Cannot determine"
+            f"FINDINGS: Analysis error: {e}\nAFFECTED_REGION: Cannot determine"
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TOOL 4 — generate_heatmap
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# AGENT 4 — generate_heatmap
+# =============================================================================
 @tool
-def generate_heatmap(image_base64: str, disease_label: str, image_analysis: str) -> str:
+def generate_heatmap(
+    disease_label: str,
+    state: Annotated[dict, InjectedState],
+) -> str:
     """
-    Call this tool AFTER analyze_image.
-    Generates a CLIP Attention Rollout heatmap overlay showing where the disease
-    is located. Uses attention rollout across ALL transformer layers for strong
-    contrast. Applies COLORMAP_JET and blends 45% over the original image.
-    Draws a red bounding box around the highest-attention region.
-    Returns the result as a base64 encoded PNG string.
+    AGENT 4 — Call this AFTER analyze_image, only if a specific disease was detected.
+    Skip this tool if analyze_image returned DISEASE: Uncertain.
+
+    Parameters:
+      disease_label: The detected disease name (e.g., "Pneumonia") from analyze_image.
+
+    Reads image_base64 automatically from shared state.
+
+    Generates a CLIP Attention Rollout heatmap across all 12 ViT transformer layers,
+    applies COLORMAP_JET (45% blend), draws red bounding box around disease region.
+
+    Returns the heatmap image as a base64 encoded PNG string.
     """
     try:
         model, processor = _get_clip()
-        pil_image = _b64_to_pil(image_base64)
-        rgb_image = pil_image.convert("RGB")
-        img_array = np.array(rgb_image, dtype=np.float32)
-        h, w = img_array.shape[:2]
+        pil_image  = _b64_to_pil(state["image_base64"])
+        rgb_image  = pil_image.convert("RGB")
+        img_array  = np.array(rgb_image, dtype=np.float32)
+        h, w       = img_array.shape[:2]
 
         image_inputs = processor(images=rgb_image, return_tensors="pt")
-
         with torch.no_grad():
             vision_out = model.vision_model(
                 pixel_values=image_inputs["pixel_values"],
                 output_attentions=True,
             )
 
-        # ── Attention Rollout across ALL layers ───────────────────────────────
-        # Accumulates attention flow from input tokens to CLS through every layer.
-        # Produces far more discriminative maps than single-layer CLS attention.
-        attentions = vision_out.attentions  # list of [1, heads, seq, seq]
-        seq_len = attentions[0].shape[-1]
-        rollout = torch.eye(seq_len)
+        # Attention Rollout across ALL layers
+        attentions = vision_out.attentions
+        seq_len    = attentions[0].shape[-1]
+        rollout    = torch.eye(seq_len)
 
         for attn_layer in attentions:
-            # Average over attention heads
-            attn_avg = attn_layer[0].mean(dim=0)  # [seq, seq]
-            # Add residual connection (identity) then row-normalise
+            attn_avg = attn_layer[0].mean(dim=0)
             attn_aug = attn_avg + torch.eye(seq_len)
             attn_aug = attn_aug / attn_aug.sum(dim=-1, keepdim=True)
-            rollout = torch.mm(attn_aug, rollout)
+            rollout  = torch.mm(attn_aug, rollout)
 
-        # CLS token (row 0) attention over all patch tokens (cols 1:)
-        mask = rollout[0, 1:].cpu().numpy().astype(np.float32)  # [num_patches]
+        mask      = rollout[0, 1:].cpu().numpy().astype(np.float32)
+        grid_size = int(round(len(mask) ** 0.5))
+        mask_2d   = mask.reshape(grid_size, grid_size)
 
-        grid_size = int(round(len(mask) ** 0.5))   # 7 for ViT-B/32
-        mask_2d = mask.reshape(grid_size, grid_size)
-
-        # ── Percentile contrast stretch (eliminates near-uniform maps) ────────
-        p2  = float(np.percentile(mask_2d, 2))
-        p98 = float(np.percentile(mask_2d, 98))
+        # Percentile contrast stretch
+        p2, p98 = float(np.percentile(mask_2d, 2)), float(np.percentile(mask_2d, 98))
         if p98 > p2:
             mask_2d = np.clip((mask_2d - p2) / (p98 - p2), 0.0, 1.0)
         else:
-            mask_2d = np.ones_like(mask_2d) * 0.5   # flat fallback
+            mask_2d = np.ones_like(mask_2d) * 0.5
 
-        # Gamma boost: raises mid-range values so heatmap is clearly visible
-        mask_2d = np.power(mask_2d, 0.4)
-
-        # ── Resize to full image resolution ───────────────────────────────────
+        mask_2d      = np.power(mask_2d, 0.4)
         attn_resized = cv2.resize(mask_2d, (w, h), interpolation=cv2.INTER_CUBIC)
         attn_smooth  = cv2.GaussianBlur(attn_resized, (25, 25), 0)
 
-        # Final normalise after blur
         v_min, v_max = attn_smooth.min(), attn_smooth.max()
         if v_max > v_min:
             attn_smooth = (attn_smooth - v_min) / (v_max - v_min)
 
-        # ── Apply COLORMAP_JET and blend ──────────────────────────────────────
         heatmap_u8  = (attn_smooth * 255).astype(np.uint8)
         heatmap_bgr = cv2.applyColorMap(heatmap_u8, cv2.COLORMAP_JET)
         heatmap_rgb = cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
+        blended     = (img_array * 0.55 + heatmap_rgb * 0.45).clip(0, 255).astype(np.uint8)
 
-        blended = (img_array * 0.55 + heatmap_rgb * 0.45).clip(0, 255).astype(np.uint8)
-
-        # ── Bounding box around top-attention region (top 30% pixels) ─────────
         threshold = float(np.percentile(attn_smooth, 70))
-        ys, xs = np.where(attn_smooth >= threshold)
+        ys, xs    = np.where(attn_smooth >= threshold)
         if len(ys) > 0:
             pad = 12
             x1 = max(0,     int(xs.min()) - pad)
@@ -868,164 +761,204 @@ def generate_heatmap(image_base64: str, disease_label: str, image_analysis: str)
             x1, y1, x2, y2 = int(w*0.2), int(h*0.2), int(w*0.8), int(h*0.8)
 
         cv2.rectangle(blended, (x1, y1), (x2, y2), (255, 0, 0), 3)
-
-        # Label
         label = disease_label[:30] if disease_label else "Disease Region"
         cv2.putText(blended, label, (x1, max(y1 - 8, 20)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2, cv2.LINE_AA)
 
         return _pil_to_b64(Image.fromarray(blended))
 
-    except Exception as exc:
-        # Guaranteed fallback: plain red-box Gaussian on original image
+    except Exception:
         try:
-            pil_image = _b64_to_pil(image_base64)
-            img_arr = np.array(pil_image.convert("RGB"), dtype=np.float32)
-            fh, fw = img_arr.shape[:2]
-            cx, cy = fw // 2, fh // 2
-            sx, sy = fw // 4, fh // 4
-            xx, yy = np.meshgrid(np.arange(fw), np.arange(fh))
-            gauss = np.exp(-((xx - cx)**2 / (2*sx**2) + (yy - cy)**2 / (2*sy**2)))
-            gauss = (gauss * 255).astype(np.uint8)
-            hmap = cv2.cvtColor(cv2.applyColorMap(gauss, cv2.COLORMAP_JET), cv2.COLOR_BGR2RGB).astype(np.float32)
-            blended = (img_arr * 0.55 + hmap * 0.45).clip(0, 255).astype(np.uint8)
-            cv2.rectangle(blended, (cx - sx, cy - sy), (cx + sx, cy + sy), (255, 0, 0), 3)
+            pil_image = _b64_to_pil(state["image_base64"])
+            img_arr   = np.array(pil_image.convert("RGB"), dtype=np.float32)
+            fh, fw    = img_arr.shape[:2]
+            cx, cy    = fw // 2, fh // 2
+            sx, sy    = fw // 4, fh // 4
+            xx, yy    = np.meshgrid(np.arange(fw), np.arange(fh))
+            gauss     = np.exp(-((xx-cx)**2/(2*sx**2) + (yy-cy)**2/(2*sy**2)))
+            gauss_u8  = (gauss * 255).astype(np.uint8)
+            hmap      = cv2.cvtColor(cv2.applyColorMap(gauss_u8, cv2.COLORMAP_JET),
+                                     cv2.COLOR_BGR2RGB).astype(np.float32)
+            blended   = (img_arr * 0.55 + hmap * 0.45).clip(0, 255).astype(np.uint8)
+            cv2.rectangle(blended, (cx-sx, cy-sy), (cx+sx, cy+sy), (255, 0, 0), 3)
             return _pil_to_b64(Image.fromarray(blended))
         except Exception:
-            return image_base64
+            return state.get("image_base64", "")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TOOL 5 — search_rag
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# AGENT 5 — search_rag
+# =============================================================================
 @tool
-def search_rag(disease_label: str, clip_embedding_json: str) -> str:
+def search_rag(disease_label: str) -> str:
     """
-    Call this tool AFTER analyze_image, in parallel with generate_heatmap.
-    Returns ONLY the knowledge document for the specific detected disease.
-    Does NOT return information about other diseases.
-    If the disease is uncertain or unknown, returns an appropriate message.
-    """
-    # Diseases we have no meaningful knowledge for
-    UNKNOWN_LABELS = {"Uncertain", "Unknown", "", "Unspecified Condition"}
+    AGENT 5 — Call this AFTER analyze_image, can run in parallel with generate_heatmap.
+    Retrieves medical knowledge ONLY for the specific detected disease.
 
-    if disease_label in UNKNOWN_LABELS:
+    Parameters:
+      disease_label: The detected disease name (e.g., "Pneumonia") from analyze_image.
+                     If disease is "Uncertain", this tool will return an appropriate message.
+
+    Returns disease-specific medical knowledge as a string.
+    Does NOT return information about other diseases.
+    """
+    UNKNOWN = {"Uncertain", "Unknown", "", "Unspecified Condition"}
+
+    if disease_label in UNKNOWN:
         return (
             "No specific medical knowledge can be provided because the disease "
             "could not be identified with sufficient confidence. "
             "Please consult a qualified medical professional for proper diagnosis."
         )
 
-    # Return ONLY this disease's document — never mix in other diseases
     doc = MEDICAL_DOCS.get(disease_label)
     if doc:
-        return f"Knowledge Base — {disease_label}:\n\n{doc}"
+        return f"Medical Knowledge — {disease_label}:\n\n{doc}"
 
-    # Disease name exists but not in our 8-disease KB
     return (
-        f"No specific information available for '{disease_label}' in this knowledge base. "
-        f"The system covers: Pneumonia, Tuberculosis, COVID-19, Brain Tumor, "
-        f"Bone Fracture, Diabetic Retinopathy, Pleural Effusion, Cardiomegaly, and Normal. "
-        f"Please consult a medical professional for information about this condition."
+        f"No specific knowledge for '{disease_label}' in this knowledge base. "
+        f"Covered diseases: Pneumonia, Tuberculosis, COVID-19, Brain Tumor, "
+        f"Bone Fracture, Diabetic Retinopathy, Pleural Effusion, Cardiomegaly, Normal."
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TOOL 6 — get_suggestions
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# AGENT 6 — get_suggestions
+# =============================================================================
 @tool
-def get_suggestions(disease: str, severity: str, specialist: str, rag_context: str) -> str:
+def get_suggestions(disease: str, severity: str, specialist: str) -> str:
     """
-    Call this tool AFTER both generate_heatmap and search_rag complete.
-    Generates structured patient-friendly medical advice for the diagnosed
-    condition and severity. Returns advice covering: IMMEDIATE_ACTIONS,
-    LIFESTYLE_CHANGES, MEDICATIONS_HINT, WARNING_SIGNS, FOLLOW_UP.
-    Uses pre-built evidence-based templates — no API key required.
-    """
-    UNKNOWN_LABELS = {"Uncertain", "Unknown", "", "Unspecified Condition"}
+    AGENT 6 — Call this AFTER both generate_heatmap and search_rag are done.
+    Generates structured patient-friendly clinical advice.
 
-    # Refuse to fabricate suggestions when diagnosis is not confident
-    if disease in UNKNOWN_LABELS:
+    Parameters:
+      disease:    The detected disease name from analyze_image (e.g., "Pneumonia").
+      severity:   The severity level from analyze_image (mild / moderate / severe).
+      specialist: The recommended specialist from analyze_image (e.g., "Pulmonologist").
+
+    If disease is "Uncertain", returns honest message that specific advice cannot be given.
+
+    Returns advice covering:
+      IMMEDIATE_ACTIONS / LIFESTYLE_CHANGES / MEDICATIONS_HINT / WARNING_SIGNS / FOLLOW_UP
+    """
+    UNKNOWN = {"Uncertain", "Unknown", ""}
+
+    if disease in UNKNOWN:
         return (
             "IMMEDIATE_ACTIONS:\n"
-            "• I cannot provide specific suggestions because the disease could not be "
-            "identified with sufficient confidence from this image.\n"
-            "• Please consult a qualified medical professional for proper diagnosis and advice.\n\n"
+            "- Cannot provide specific suggestions — disease not identified with sufficient confidence\n"
+            "- Please consult a qualified medical professional for proper diagnosis and advice\n"
+            "- Bring this image to your doctor's appointment\n\n"
             "FOLLOW_UP:\n"
-            "• See a General Practitioner who can examine you and request appropriate tests.\n"
-            "• Bring this image and any symptoms you are experiencing to the appointment."
+            "- See a General Practitioner who can request appropriate tests\n"
+            "- Mention all symptoms you are experiencing at the appointment"
         )
 
+    key     = disease if disease in _SUGG else None
+    if key is None:
+        return (
+            f"IMMEDIATE_ACTIONS:\n"
+            f"- '{disease}' is outside the 8 diseases this system covers\n"
+            f"- Please consult a {specialist} for condition-specific guidance\n\n"
+            f"FOLLOW_UP:\n- See a {specialist} as soon as possible"
+        )
+
+    db      = _SUGG[key]
+    sev_key = severity.lower() if severity.lower() in ("mild", "moderate", "severe") else "moderate"
+    followup_time = db["followup"].get(sev_key, "as soon as possible")
+
+    lines = [
+        f"Suggestions for: {disease} ({severity.capitalize()} severity)",
+        "-" * 50,
+        "",
+        "IMMEDIATE_ACTIONS:",
+        *[f"- {a}" for a in db["immediate"]],
+        "",
+        "LIFESTYLE_CHANGES:",
+        *[f"- {a}" for a in db["lifestyle"]],
+        "",
+        "MEDICATIONS_HINT:",
+        *[f"- {a}" for a in db["medications"]],
+        "",
+        "WARNING_SIGNS:",
+        *[f"- {a}" for a in db["warning"]],
+        "",
+        "FOLLOW_UP:",
+        f"- See a {specialist} {followup_time}",
+        "- Bring all previous imaging reports and medical records to your appointment",
+        "- Ask your doctor which follow-up tests are needed",
+    ]
+    return "\n".join(lines)
+
+
+# =============================================================================
+# AGENT 7 — translate_report
+# =============================================================================
+@tool
+def translate_report(state: Annotated[dict, InjectedState]) -> str:
+    """
+    AGENT 7 — Call this LAST after get_suggestions.
+    Builds the complete medical report from shared state, translates it to the
+    user's selected language, and generates voice audio.
+
+    No parameters needed — reads disease, findings, suggestions, and language
+    automatically from shared state.
+
+    If language is English, returns report unchanged.
+    Otherwise uses free Google Translate (no API key).
+    Audio generated using free gTTS (no API key).
+
+    Returns JSON string with: translated_text, audio_base64.
+    """
+    from datetime import datetime
+
     try:
-        key = disease if disease in _SUGG else None
-        if key is None:
-            return (
-                f"IMMEDIATE_ACTIONS:\n"
-                f"• '{disease}' is outside the 8 diseases this system covers.\n"
-                f"• Please consult a {specialist} for condition-specific guidance.\n\n"
-                f"FOLLOW_UP:\n"
-                f"• See a {specialist} as soon as possible with this imaging report."
+        disease    = state.get("disease_label", "Unknown")
+        severity   = state.get("severity", "unknown").upper()
+        confidence = state.get("confidence", 0.0)
+        specialist = state.get("specialist", "General Practitioner")
+        language   = state.get("language", "English")
+        ts         = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        clip_scores = state.get("clip_scores", {})
+        clip_lines  = ""
+        if clip_scores:
+            top3 = sorted(clip_scores.items(), key=lambda x: x[1], reverse=True)[:3]
+            clip_lines = "\n  CLIP Top Predictions:\n" + "\n".join(
+                f"    {d}: {p*100:.1f}%" for d, p in top3
             )
 
-        db = _SUGG[key]
-        sev_key = severity.lower() if severity.lower() in ("mild", "moderate", "severe") else "moderate"
-        followup_time = db["followup"].get(sev_key, "as soon as possible")
-
-        lines = [
-            f"Suggestions for: {disease} ({severity.capitalize()} severity)",
-            "-" * 50,
-            "",
-            "IMMEDIATE_ACTIONS:",
-            *[f"• {a}" for a in db["immediate"]],
-            "",
-            "LIFESTYLE_CHANGES:",
-            *[f"• {a}" for a in db["lifestyle"]],
-            "",
-            "MEDICATIONS_HINT:",
-            *[f"• {a}" for a in db["medications"]],
-            "",
-            "WARNING_SIGNS:",
-            *[f"• {a}" for a in db["warning"]],
-            "",
-            "FOLLOW_UP:",
-            f"• See a {specialist} {followup_time}",
-            "• Bring all previous imaging reports and medical records to your appointment",
-            "• Ask your doctor which follow-up tests or investigations are needed",
-        ]
-        return "\n".join(lines)
-
-    except Exception as e:
-        return (
-            f"Could not generate suggestions: {str(e)}\n"
-            f"Please consult a {specialist} directly."
+        report = (
+            f"{'=' * 62}\n"
+            f"{'MEDICAL IMAGE AI ANALYSIS REPORT':^62}\n"
+            f"{'Generated: ' + ts:^62}\n"
+            f"{'=' * 62}\n\n"
+            f"  DIAGNOSIS SUMMARY\n"
+            f"  Condition     : {disease}\n"
+            f"  Severity      : {severity}\n"
+            f"  AI Confidence : {confidence * 100:.1f}%\n"
+            f"  Specialist    : {specialist}\n"
+            f"{clip_lines}\n\n"
+            f"  DETAILED FINDINGS\n"
+            f"{state.get('image_analysis', 'Not available.')}\n\n"
+            f"  MEDICAL KNOWLEDGE\n"
+            f"{state.get('rag_context', 'Not available.')}\n\n"
+            f"  PATIENT RECOMMENDATIONS\n"
+            f"{state.get('suggestions', 'Not available.')}\n\n"
+            f"  DISCLAIMER: This AI analysis is for informational purposes only\n"
+            f"  and does NOT replace professional medical diagnosis.\n"
+            f"{'=' * 62}\n"
         )
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TOOL 7 — translate_report
-# ─────────────────────────────────────────────────────────────────────────────
-@tool
-def translate_report(report: str, language: str) -> str:
-    """
-    Call this tool LAST after get_suggestions.
-    If language is 'English', returns the report unchanged.
-    Otherwise translates using deep-translator (free Google Translate, no API key).
-    Also generates gTTS audio (free Google TTS, no API key) for the report.
-    Returns a JSON string with keys: translated_text, audio_base64.
-    """
-    try:
-        lang_code = _LANG_CODES.get(language)
+        lang_code  = _LANG_CODES.get(language)
         translated = _translate_text(report, lang_code) if lang_code else report
 
         try:
             gtts_code = _GTTS_CODES.get(language, "en")
-            clean = re.sub(r"[═║╔╚╗╝╠╣╦╩╬─━│┃]", " ", translated)
-            clean = clean.replace("⚠️", "Warning:").replace("•", "").strip()
-            clean = re.sub(r"[ \t]{2,}", " ", clean)
-            clean = re.sub(r"\n{3,}", "\n\n", clean)[:3000]
-
-            tts = gTTS(text=clean, lang=gtts_code, slow=False)
-            buf = io.BytesIO()
+            clean = re.sub(r"[=|]", " ", translated).replace("•", "").strip()
+            clean = re.sub(r"[ \t]{2,}", " ", clean)[:3000]
+            tts   = gTTS(text=clean, lang=gtts_code, slow=False)
+            buf   = io.BytesIO()
             tts.write_to_fp(buf)
             audio_b64 = base64.b64encode(buf.getvalue()).decode()
         except Exception:
@@ -1034,4 +967,4 @@ def translate_report(report: str, language: str) -> str:
         return json.dumps({"translated_text": translated, "audio_base64": audio_b64})
 
     except Exception as e:
-        return json.dumps({"translated_text": report, "audio_base64": "", "error": str(e)})
+        return json.dumps({"translated_text": f"Report generation failed: {e}", "audio_base64": ""})
